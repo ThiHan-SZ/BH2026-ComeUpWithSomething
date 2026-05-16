@@ -1,155 +1,168 @@
-import os
-import cv2
+import threading
 import time
 import queue
-import threading
 import numpy as np
-from typing import Callable, Optional, Any, List, Dict
-from ultralytics import YOLO
+import cv2
+
+from gz.transport13 import Node
+from gz.msgs10.image_pb2 import Image
 
 class Detector:
-    def __init__(
-        self,
-        model_path: str = "yolov8n.pt",
-        confidence_threshold: float = 0.5,
-        callback: Optional[Callable[[List[Dict[str, Any]], np.ndarray, Optional[Any]], None]] = None,
-        num_workers: int = 1,
-        device: str = "cpu",
-        save_dir: str = "./detected_images",
-        enable_display: bool = True,
-        display_window_name: str = "YOLO Detections"
-    ):
-        self.model = YOLO(model_path).to(device)
-        self.conf_threshold = confidence_threshold
-        self.callback = callback
-        self.queue = queue.Queue()
-        self.stop_event = threading.Event()
-        self.workers = []
-        
-        # Setup save directory
-        self.save_dir = os.path.abspath(save_dir)
-        os.makedirs(self.save_dir, exist_ok=True)
-        self._file_counter = 0
-        self._counter_lock = threading.Lock()
-        
-        # Display configuration
-        self.enable_display = enable_display
-        self.display_window_name = display_window_name
-        # Maxsize=1 ensures we always show the LATEST frame, dropping old ones to prevent UI lag
-        self.display_queue = queue.Queue(maxsize=1)
-        self.display_thread = None
-        
-        self._start_workers(num_workers)
-        
-        if self.enable_display:
-            self.display_thread = threading.Thread(target=self._display_worker, daemon=True)
-            self.display_thread.start()
+    def __init__(self):
+        print("Initializing Object Detector...")
+        time.sleep(1)
+        print("Detector ready.")
 
-    def _start_workers(self, num_workers: int) -> None:
-        for _ in range(num_workers):
-            t = threading.Thread(target=self._worker, daemon=False)
-            t.start()
-            self.workers.append(t)
+    def run_inference(self, frame):
+        """
+        Takes a BGR frame and returns a detection result.
+        Replace this placeholder logic with actual model inference.
+        """
+        if frame is not None:
+            return {
+                "status": "success",
+                "detections": [
+                    {
+                        "class": "target",
+                        "confidence": 0.92,
+                        "box": [100, 100, 50, 50],
+                    }
+                ],
+            }
+        return {"status": "empty", "detections": []}
 
-    def submit_image(self, image: np.ndarray, context: Optional[Dict[str, Any]] = None) -> None:
-        if context is None:
-            context = {}
-        self.queue.put((image, context))
+class DepthReceiver:
+    def __init__(self, topic, shared_state):
+        self.node = Node()
+        self.topic = topic
+        self.shared_state = shared_state
+        self.latest_depth = None
+        self.lock = threading.Lock()
 
-    def _get_next_filename(self) -> str:
-        with self._counter_lock:
-            self._file_counter += 1
-            ts = int(time.time() * 1000)
-            return f"det_{self._file_counter}_{ts}.jpg"
+        self.node.subscribe(Image, topic, self.depth_callback)
+        print(f"DepthReceiver subscribed to: {topic}")
 
-    def _display_worker(self) -> None:
-        """Dedicated thread for rendering detected images."""
-        cv2.namedWindow(self.display_window_name, cv2.WINDOW_AUTOSIZE)
-        while not self.stop_event.is_set():
+    def depth_callback(self, msg):
+        try:
+            if not msg.data:
+                return
+
+            raw = bytes(msg.data)
+            expected_float32 = msg.width * msg.height * 4
+            expected_uint16 = msg.width * msg.height * 2
+
+            if len(raw) == expected_float32:
+                depth_raw = np.frombuffer(raw, dtype=np.float32)
+                depth_image = depth_raw.reshape((msg.height, msg.width))
+
+            elif len(raw) == expected_uint16:
+                depth_raw = np.frombuffer(raw, dtype=np.uint16)
+                depth_image = depth_raw.reshape((msg.height, msg.width)).astype(np.float32)
+
+            else:
+                print(
+                    f"Unexpected depth buffer size: {len(raw)}, "
+                    f"expected {expected_float32} or {expected_uint16}"
+                )
+                return
+
+            valid_depth = depth_image[np.isfinite(depth_image)]
+
+            if valid_depth.size == 0:
+                depth_data = {
+                    "timestamp": time.time(),
+                    "min_depth": None,
+                    "max_depth": None,
+                    "mean_depth": None,
+                    "shape": depth_image.shape,
+                    "raw_data": depth_image,
+                    "valid_pixels": 0,
+                }
+            else:
+                depth_data = {
+                    "timestamp": time.time(),
+                    "min_depth": float(valid_depth.min()),
+                    "max_depth": float(valid_depth.max()),
+                    "mean_depth": float(valid_depth.mean()),
+                    "shape": depth_image.shape,
+                    "raw_data": depth_image,
+                    "valid_pixels": int(valid_depth.size),
+                }
+
+            self.shared_state.update_depth(depth_data)
+        except Exception as e:
+            print(f"Depth callback error: {e}")
+
+
+class RGBReceiver:
+    def __init__(self, topic, shared_state, detection_queue):
+        self.node = Node()
+        self.topic = topic
+        self.shared_state = shared_state
+        self.detection_queue = detection_queue
+        self.latest_frame = None
+        self.lock = threading.Lock()
+
+        self.node.subscribe(Image, topic, self.rgb_callback)
+        print(f"RGBReceiver subscribed to: {topic}")
+
+    def rgb_callback(self, msg):
+        try:
+            if not msg.data:
+                return
+
+            frame_raw = np.frombuffer(msg.data, dtype=np.uint8)
+            frame_rgb = frame_raw.reshape((msg.height, msg.width, 3))
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+            rgb_data = {
+                "timestamp": time.time(),
+                "image": frame_bgr,
+                "shape": frame_bgr.shape,
+                "frame_id": self.topic,
+            }
+
+            with self.lock:
+                self.latest_frame = frame_bgr
+
+            self.shared_state.update_vision(rgb_data)
+
             try:
-                img = self.display_queue.get(timeout=0.05)
-                if img is not None:
-                    cv2.imshow(self.display_window_name, img)
-                    cv2.waitKey(1)  # Mandatory for OpenCV GUI event processing
+                self.detection_queue.put_nowait(frame_bgr.copy())
+            except queue.Full:
+                pass
+
+        except Exception as e:
+            print(f"RGB callback error: {e}")
+
+class DetectorWorker(threading.Thread):
+    def __init__(self, detection_queue, shared_state, detector):
+        super().__init__(daemon=True)
+        self.detection_queue = detection_queue
+        self.shared_state = shared_state
+        self.detector = detector
+        self.running = True
+
+    def run(self):
+        while self.running:
+            try:
+                frame = self.detection_queue.get(timeout=1.0)
+                detection_output = self.detector.run_inference(frame)
+
+                detection_data = {
+                    "timestamp": time.time(),
+                    "detections": detection_output.get("detections", []),
+                    "status": detection_output.get("status", "unknown"),
+                    "frame_shape": frame.shape,
+                    "num_detections": len(detection_output.get("detections", [])),
+                }
+
+                self.shared_state.update_planner(detection_data)
+
             except queue.Empty:
                 continue
-            except cv2.error as e:
-                print(f"[Display] CV2 error: {e}")
-                break
-        cv2.destroyWindow(self.display_window_name)
-
-    def _worker(self) -> None:
-        while not self.stop_event.is_set() or not self.queue.empty():
-            try:
-                image, context = self.queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-
-            try:
-                results = self.model(image, verbose=False, conf=self.conf_threshold)
-                
-                detections = []
-                annotated_image = None
-                has_detections = False
-
-                for result in results:
-                    boxes = result.boxes
-                    if boxes is not None and len(boxes) > 0:
-                        has_detections = True
-                        for box in boxes:
-                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().tolist()
-                            conf = float(box.conf[0].cpu().item())
-                            cls_id = int(box.cls[0].cpu().item())
-                            
-                            detections.append({
-                                "bbox": [x1, y1, x2, y2],
-                                "confidence": conf,
-                                "class_id": cls_id,
-                                "class_name": self.model.names[cls_id]
-                            })
-                        annotated_image = result.plot()
-
-                if has_detections and annotated_image is not None:
-                    # 1. Save to disk
-                    filename = self._get_next_filename()
-                    filepath = os.path.join(self.save_dir, filename)
-                    cv2.imwrite(filepath, annotated_image)
-                    context["saved_path"] = filepath
-
-                    # 2. Push to display thread (non-blocking: drops old frames if UI is slow)
-                    if self.enable_display:
-                        try:
-                            self.display_queue.put_nowait(annotated_image)
-                        except queue.Full:
-                            pass  # Skip frame to keep display real-time
-
-                    # 3. Trigger callback
-                    if self.callback:
-                        try:
-                            self.callback(detections, annotated_image, context)
-                        except Exception as e:
-                            print(f"[Detector] Callback error: {e}")
-
             except Exception as e:
-                print(f"[Detector] Inference error: {e}")
-            finally:
-                self.queue.task_done()
-                # Explicit memory cleanup as requested
-                del image
-                del context
-                del results
-                del detections
-                del annotated_image
+                print(f"Detector worker error: {e}")
 
-    def stop(self) -> None:
-        """Gracefully shutdown all threads."""
-        self.stop_event.set()
-        for t in self.workers:
-            t.join()
-        if self.display_thread and self.display_thread.is_alive():
-            self.display_thread.join()
-        print(f"[Detector] All workers and display thread stopped.")
-
-    def set_display(self, enabled: bool) -> None:
-        """Toggle display at runtime."""
-        self.enable_display = enabled
+    def stop(self):
+        self.running = False
