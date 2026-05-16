@@ -4,7 +4,7 @@ test: ../test/images
 
 nc: 2
 names: ['red_barrel', 'yellow_barrel']
-
+g
 roboflow:
   workspace: thesteelsentinels-workspace
   project: thesteelsentinels-workspace
