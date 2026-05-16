@@ -1,0 +1,20 @@
+# Virtual environment
+venv/
+
+# Python temporary files
+*.pyc
+*.pyo
+*.pyd
+*.pycache/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Package manager
+__pycache__/
+*.egg-info/
+dist/
+build/
