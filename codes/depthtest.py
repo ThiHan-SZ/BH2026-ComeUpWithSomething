@@ -15,10 +15,11 @@ def depth_callback(msg):
     # 3. Scale for visibility
     # This rescales the actual meter values (0-10m) to a 0-255 grayscale range
     visible_depth = cv2.normalize(depth_img, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+    inverted_depth = 255 - visible_depth
 
     # 4. (Optional) Apply a Colormap for better intuition
     # Makes the "black" image look like a heat map (blue=far, red=near)
-    color_depth = cv2.applyColorMap(visible_depth, cv2.COLORMAP_JET)
+    color_depth = cv2.applyColorMap(inverted_depth, cv2.COLORMAP_JET)
 
     cv2.imshow("Corrected Depth Feed", color_depth)
     cv2.waitKey(1)
