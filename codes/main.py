@@ -1,5 +1,3 @@
-# main.py
-from structure import telemetry, depth, vision, planner
 from shared_state import SharedState
 
 def main():

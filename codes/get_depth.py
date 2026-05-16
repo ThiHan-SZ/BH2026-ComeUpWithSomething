@@ -3,7 +3,7 @@ import time
 from gz.transport13 import Node
 from gz.msgs10.image_pb2 import Image
 
-def depth_callback(msg: Image):
+def depth_callback(msg):
     # 1️⃣ Verify encoding (Protobuf field is 'pixel_format' in msgs10)
     fmt = msg.pixel_format
     if "FLOAT32" not in fmt and "32FC1" not in fmt:
