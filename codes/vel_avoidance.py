@@ -6,7 +6,7 @@ import time
 from depth_receiver import DepthReceiver
 from drone_control import Drone
 from VelocityPlanner import VelocityPlanner
-
+from simpleWallFollower import WallFollower
 
 class DroneNavigation:
     def __init__(self,
@@ -31,7 +31,14 @@ class DroneNavigation:
 
         self.receiver = DepthReceiver(depth_topic)
         self.planner = VelocityPlanner(K=K,width=640,height=480,safe_distance=4.0,critical_distance=1.5)
-
+        self.wall_follower = WallFollower(
+            wall_follow_dist=2.0,
+            wall_band=0.6,
+            critical_dist=1.0,
+            safe_dist=2.5,
+            max_speed=0.8,
+            turn_speed=0.4,
+        )
         self.drone = Drone()
 
     # =========================
@@ -96,20 +103,20 @@ class DroneNavigation:
                 # NEEDS TO BE ADDED BUT NOT ADDED YET.
                 # ==================================
                 c = info['clearance']
-                print(f"Blocked={info['blocked']} | vx={n_vx:.2f}, vy={n_vy:.2f} | left-{c['left']} center-{c['center']} right- {c['right']}")
+                cmd = self.wall_follower.compute(c['left'], c['center'], c['right'])
 
-                if info['blocked']:
-                    await self.drone.send_velocity(0, 0, 0, self.target_yaw_deg)
-                    await self.rotate_next_direction()
-                else:
-                    # Ensure alignment before motion
-                    await self.align_to_grid()
-                    await self.drone.send_velocity(
-                        vx=n_vx,
-                        vy=n_vy,
-                        vz=0.0,
-                        yaw_deg=self.target_yaw_deg
-                    )
+                # Convert camera-frame velocity to NED
+                n_vx, n_vy = self.camera_to_ned(cmd['vx'], cmd['vy'], self.target_yaw_deg)
+
+                print(f"[{cmd['state']:<18}] fwd={cmd['vx']:.2f} lat={cmd['vy']:+.2f} | "
+                    f"L={c['left']:.1f} C={c['center']:.1f} R={c['right']:.1f}")
+
+                await self.drone.send_velocity(
+                    vx=n_vx,
+                    vy=n_vy,
+                    vz=0.0,
+                    yaw_deg=self.target_yaw_deg  # heading stays fixed; lateral motion is strafing
+                )
 
                 # Maintain loop timing
                 elapsed = time.monotonic() - t_start
