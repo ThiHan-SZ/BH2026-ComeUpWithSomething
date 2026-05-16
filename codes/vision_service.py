@@ -5,28 +5,12 @@ import cv2
 
 from gz.transport13 import Node
 from gz.msgs10.image_pb2 import Image
+from Detector import Detector
 
 # ==========================================
 # 1. MOCK DETECTOR CLASS
 # Replace this or import your real model here
 # ==========================================
-class Detector:
-    def __init__(self):
-        print("Initializing Object Detector...")
-        # e.g., self.model = yolov8.load('yolov8n.pt')
-        time.sleep(1) # Simulating model loading time
-        print("Detector ready.")
-
-    def run_inference(self, frame):
-        """
-        Takes a BGR frame and returns a detection result.
-        Replace this placeholder logic with your actual model inference.
-        """
-        # Placeholder result format: (label, confidence, bbox [x, y, w, h])
-        # For testing, we just simulate finding a target if the image is valid
-        if frame is not None:
-            return {"status": "success", "detections": [{"class": "target", "confidence": 0.92, "box": [100, 100, 50, 50]}]}
-        return {"status": "empty", "detections": []}
 
 
 # ==========================================

@@ -6,30 +6,70 @@ import cv2
 
 from gz.transport13 import Node
 from gz.msgs10.image_pb2 import Image
+from ultralytics import YOLO
 
 class Detector:
-    def __init__(self):
-        print("Initializing Object Detector...")
-        time.sleep(1)
-        print("Detector ready.")
+    def __init__(
+        self,
+        base_model_path: str = "yolov10n.pt",
+        finetuned_weights: str = "models/barrel_detector_best.pt",
+        device: str = "cpu",
+        conf_threshold: float = 0.6,
+    ):
+        print("[Detector] Initializing YOLOv10 detector...")
 
-    def run_inference(self, frame):
-        """
-        Takes a BGR frame and returns a detection result.
-        Replace this placeholder logic with actual model inference.
-        """
-        if frame is not None:
-            return {
-                "status": "success",
-                "detections": [
-                    {
-                        "class": "target",
-                        "confidence": 0.92,
-                        "box": [100, 100, 50, 50],
-                    }
-                ],
-            }
-        return {"status": "empty", "detections": []}
+        try:
+            self.model = YOLO(finetuned_weights).to(device)
+            print(f"[Detector] Loaded fine-tuned weights: {finetuned_weights}")
+        except Exception as e:
+            print(f"[Detector] Failed to load {finetuned_weights}: {e}")
+            print(f"[Detector] Falling back to base model: {base_model_path}")
+            self.model = YOLO(base_model_path).to(device)
+
+        self.conf_threshold = conf_threshold
+        self.device = device
+        print("[Detector] Ready.")
+
+    def run_inference(self, frame: np.ndarray) -> dict:
+        if frame is None or frame.size == 0:
+            return {"status": "empty", "detections": [], "annotated": None}
+
+        try:
+            results = self.model(frame, verbose=False, conf=self.conf_threshold)
+
+            all_dets = []
+            annotated = None
+
+            for r in results:
+                boxes = r.boxes
+                if boxes is None or len(boxes) == 0:
+                    continue
+
+                # Let Ultralytics draw all boxes once per Result
+                if annotated is None:
+                    annotated = r.plot()  # BGR image with boxes & labels
+
+                for box in boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().tolist()
+                    conf = float(box.conf[0].cpu().item())
+                    cls_id = int(box.cls[0].cpu().item())
+                    class_name = r.names[cls_id]
+
+                    w = x2 - x1
+                    h = y2 - y1
+
+                    all_dets.append({
+                        "class": class_name,
+                        "confidence": conf,
+                        "box": [x1, y1, w, h],
+                    })
+
+            status = "success" if all_dets else "empty"
+            return {"status": status, "detections": all_dets, "annotated": annotated}
+
+        except Exception as e:
+            print(f"[Detector] Inference error: {e}")
+            return {"status": "error", "detections": [], "annotated": None}
 
 class DepthReceiver:
     def __init__(self, topic, shared_state):
@@ -149,13 +189,33 @@ class DetectorWorker(threading.Thread):
                 frame = self.detection_queue.get(timeout=1.0)
                 detection_output = self.detector.run_inference(frame)
 
+                detections = detection_output.get("detections", [])
+                annotated = detection_output.get("annotated", None)
+
                 detection_data = {
                     "timestamp": time.time(),
-                    "detections": detection_output.get("detections", []),
+                    "detections": detections,
                     "status": detection_output.get("status", "unknown"),
                     "frame_shape": frame.shape,
-                    "num_detections": len(detection_output.get("detections", [])),
+                    "num_detections": len(detections),
                 }
+
+                # --- 2a. Save detectX.jpg when we have at least one barrel ---
+                if annotated is not None and detections:
+                    # Optional: ensure box shows at least 50% of barrel by slightly enlarging
+                    # the drawn boxes is already handled by YOLO’s default annotations,
+                    # but you can re-draw if you want to pad by, say, 1.2x.
+
+                    ts = int(time.time() * 1000)
+                    filename = f"detect_{ts}.jpg"
+                    cv2.imwrite(filename, annotated)
+                    detection_data["saved_image"] = filename  # for logging/telemetry
+
+                # --- 2b. Optional: live display window ---
+                # (only during testing, not in final autonomous run)
+                if annotated is not None:
+                    cv2.imshow("Barrel Detections", annotated)
+                    cv2.waitKey(1)
 
                 self.shared_state.update_planner(detection_data)
 
