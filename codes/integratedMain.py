@@ -7,28 +7,25 @@ import os
 import queue
 import cv2
 
-# ===================================
-# IMPORT ALL MODULE DEPENDENCIES
-# ===================================
+# --- Navigation Imports ---
 from depth_receiver import DepthReceiver
 from drone_control import Drone
 from AvoidancePlanner import AvoidancePlanner
-from get_position_with_task import SharedState as DroneSharedState, position_monitor_task
+from get_position_with_task import SharedState as NavSharedState, position_monitor_task
 
-# Vision dependencies from Detector.py
+# --- Vision Imports ---
 from Detector import Detector, SharedState as VisionSharedState, RGBReceiver, DetectorWorker
 from mavsdk.action import ActionError
-
 
 class IntegratedDroneApp:
     def __init__(self, depth_topic="/depth_camera", loop_hz=10.0):
         print("[System] Initializing Integrated Navigation & Vision Systems...")
+        
+        # ===================================
+        # 🛰️ NAVIGATION & DRONE PROPERTIES
+        # ===================================
         self.loop_hz = loop_hz
         self.running = True
-
-        # -----------------------------------
-        # 🎯 NAVIGATION SETTINGS & TRACKING
-        # -----------------------------------
         self.target_yaw_deg = 0.0
         self.yaw_tolerance = 4.0          
         self.large_turn_threshold = 15.0  
@@ -46,37 +43,29 @@ class IntegratedDroneApp:
                       [0.0, 433.0, 240.0],
                       [0.0, 0.0, 1.0]])
 
-        # Navigation Components
         self.receiver = DepthReceiver(depth_topic)
         self.planner = AvoidancePlanner(K=K, width=640, height=480, safe_distance=4.0, critical_distance=1.5)
         self.drone = Drone()
-        self.position_state = DroneSharedState()    
+        self.position_state = NavSharedState()    
         self.monitor_task = None
         
         self.last_command_time = 0.0
         self.command_interval = 0.1  
 
-        # -----------------------------------
-        # 👁️ VISION & DETECTION SYSTEM SETUP
-        # -----------------------------------
-        self.vision_state = VisionSharedState()
+        # ===================================
+        # 👁️ VISION & DETECTION PROPERTIES (Deferred Initialization)
+        # ===================================
+        self.vision_shared_state = VisionSharedState()
         self.detection_queue = queue.Queue(maxsize=1) 
         self.ui_queue = queue.Queue(maxsize=1) 
 
-        # Track model file position
-        finetuned = "models/barrel_detector_best.pt"
-        if not os.path.exists(finetuned) and os.path.exists("../models/barrel_detector_best.pt"):
-            finetuned = "../models/barrel_detector_best.pt"
+        # Track model file position from inside the codes directory
+        self.finetuned_path = "models/barrel_detector_best.pt"
+        if not os.path.exists(self.finetuned_path) and os.path.exists("../models/barrel_detector_best.pt"):
+            self.finetuned_path = "../models/barrel_detector_best.pt"
 
-        self.detector = Detector(
-            base_model_path="yolov10n.pt",
-            finetuned_weights=finetuned,
-            device="cpu",
-            conf_threshold=0.6
-        )
-        
-        self.vision_worker = None
-        self.rgb_receiver = None
+        self.detector = None
+        self.worker = None
         self.rgb_topic = "/world/roboverse/model/x500_vision_0/link/camera_link/sensor/IMX214/image"
 
     def _yaw_error(self, target, current):
@@ -92,100 +81,28 @@ class IntegratedDroneApp:
         self.pose["yaw_deg"]   = self.position_state.latest_yaw
         self.pose["yaw"] = np.deg2rad(self.pose["yaw_deg"])
 
-    async def run_vision_ui_loop(self):
-        """Asynchronous wrapper for managing OpenCV UI without blocking navigation."""
-        print("[Vision] Spawning explicit UI loop helper...")
+    async def run_vision_ui(self):
+        """Displays OpenCV window without blocking execution loop."""
         cv2.namedWindow("Barrel Detections", cv2.WINDOW_AUTOSIZE)
-        
         try:
             while self.running:
                 try:
-                    # Non-blocking fetch from UI Queue
                     frame_to_show = self.ui_queue.get_nowait()
                     cv2.imshow("Barrel Detections", frame_to_show)
                 except queue.Empty:
                     pass
-
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    print("[Vision] 'q' pressed. Shutting down system...")
+                
+                # Check for UI exit key 'q'
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    print("[Vision] User exited UI window.")
                     self.stop()
                     break
-                
-                await asyncio.sleep(0.01)
-        except Exception as e:
-            print(f"[Vision UI Error] {e}")
+                await asyncio.sleep(0.01) # Yield execution control back to loop
         finally:
             cv2.destroyAllWindows()
 
-    async def wait_for_arming_health(self):
-        """Polls PX4 telemetry state until pre-flight checks are cleared."""
-        print("[Navigation] Waiting for autopilot health checks to pass...")
-        async for health in self.drone.drone.telemetry.health():
-            if health.is_home_position_ok and health.is_local_position_ok:
-                print("[Navigation] Pre-flight checks passed! Position locks obtained.")
-                break
-            print("[Navigation] Still waiting for position tracking alignment...")
-            await asyncio.sleep(1.0)
-
-    async def run(self):
-        print("\n🔍 RUNNING CORNER-GUARDED INERTIAL RECOVERY NAVIGATION WITH INTEGRATED DETECTOR\n")
-
-        # -------------------------------------------------------------
-        # STEP 1: CONNECT & VERIFY HEALTH BEFORE ARMING
-        # -------------------------------------------------------------
-        print("[Navigation] Connecting to drone flight controller...")
-        await self.drone.connect()
-        await asyncio.sleep(2)
-        
-        print("[Navigation] Starting position monitor.")
-        self.monitor_task = asyncio.create_task(position_monitor_task(self.drone, self.position_state, asyncio.Event()))
-        
-        # Wait until PX4 allows arming
-        await self.wait_for_arming_health()
-
-        print("[Navigation] Sending Arm and Takeoff command...")
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                await self.drone.arm_and_takeoff()
-                print("[Navigation] Takeoff command accepted successfully.")
-                break
-            except ActionError as e:
-                print(f"[Navigation] Arming attempt {attempt + 1}/{max_retries} Denied: {e}")
-                if attempt == max_retries - 1:
-                    print("❌ Critical: Autopilot persistently rejected arming sequence. Aborting.")
-                    self.stop()
-                    return
-                await asyncio.sleep(2)
-        
-        await asyncio.sleep(1.0)
-        await self.update_pose()
-        self.target_yaw_deg = self.pose["yaw_deg"]
-
-        # -------------------------------------------------------------
-        # STEP 2: SPIN UP VISION HEAVY THREADS ONCE SAFELY AIRBORNE
-        # -------------------------------------------------------------
-        print("[Vision] Initializing backend detector pipeline...")
-        target_save_directory = "../detections"
-        self.vision_worker = DetectorWorker(
-            self.detection_queue, 
-            self.ui_queue, 
-            self.vision_state, 
-            self.detector,
-            save_dir=target_save_directory
-        )
-        self.vision_worker.start()
-        
-        print("[Vision] Connecting to Gazebo camera network streams...")
-        self.rgb_receiver = RGBReceiver(self.rgb_topic, self.vision_state, self.detection_queue)
-
-        # Spawn the concurrent async OpenCV UI window helper task
-        asyncio.create_task(self.run_vision_ui_loop())
-
-        # -------------------------------------------------------------
-        # STEP 3: MAIN NAVIGATION LOOP
-        # -------------------------------------------------------------
+    async def run_navigation_loop(self):
+        """Continuous obstacle avoidance navigation loop executed after takeoff."""
         try:
             while self.running:
                 t_start = time.monotonic()
@@ -208,34 +125,42 @@ class IntegratedDroneApp:
                 current_time = time.monotonic()
                 if (current_time - self.last_command_time) >= self.command_interval:
                     
+                    # -------------------------------------------------
                     # 🔄 INERTIAL RECOVERY LOGIC (STRAIGHT BACKWARD)
+                    # -------------------------------------------------
                     if info['blocked']:
                         if not self.is_recovering:
+                            # Capture orientation right before stopping
                             self.recovery_yaw_deg = self.pose["yaw_deg"]
                             self.is_recovering = True
                             print(f"⚠️ DEAD END DETECTED! Latching baseline heading: {self.recovery_yaw_deg:.1f}°")
 
                         print(f"⚠️ RECOVERY ACTIVE: Backing out straight down corridor axis...")
                         
+                        # Calculate static backward vector components relative to the latched corridor angle
                         recovery_yaw_rad = np.deg2rad(self.recovery_yaw_deg)
                         v_north = -0.3 * math.cos(recovery_yaw_rad)
                         v_east  = -0.3 * math.sin(recovery_yaw_rad)
                         
+                        # Convert global vector to a body command to preserve flight axis
                         current_yaw_rad = self.pose["yaw"]
                         vx_body = v_north * math.cos(current_yaw_rad) + v_east * math.sin(current_yaw_rad)
                         vy_body = -v_north * math.sin(current_yaw_rad) + v_east * math.cos(current_yaw_rad)
                         
                         await self.drone.send_velocity(vx_body, vy_body, 0.0, self.target_yaw_deg)
                         
+                        # Flush smoothing lag memories to prevent rapid snaps on recovery exit
                         self.planner.prev_north = None 
                         self.planner.prev_east = None
                     
                     else:
+                        # Clear recovery flag once front clearance reopens
                         if self.is_recovering:
                             print("🎉 Path cleared! Resuming standard flight setpoints.")
                             self.is_recovering = False
 
                         if abs(heading_error) > self.large_turn_threshold:
+                            # Large rotation required: Pivot on spot
                             print(f"🔄 Large Heading Shift Required ({heading_error:.1f}°). Holding position to pivot.")
                             await self.drone.send_position_setpoint(
                                 north=self.pose["north"],
@@ -244,6 +169,7 @@ class IntegratedDroneApp:
                                 yaw_deg=self.target_yaw_deg
                             )
                         else:
+                            # Standard tracking flight mode
                             await self.drone.send_position_setpoint(
                                 north=north,
                                 east=east,
@@ -263,40 +189,89 @@ class IntegratedDroneApp:
         except asyncio.CancelledError:
             print("🛑 Navigation cancelled")
         finally:
-            self.shutdown()
+            try:
+                await self.drone.send_velocity(0, 0, 0, self.pose["yaw_deg"])
+            except Exception:
+                pass
+            print("Drone hovering safely")
 
     def stop(self):
         self.running = False
+        if self.worker is not None:
+            self.worker.stop()
 
-    def shutdown(self):
-        print("\n[System] Commencing unified shutdown sequences...")
-        self.running = False
+    async def main_lifecycle(self):
+        # 1. RUN FLIGHT SETUP SCRIPT CONTEXT IN ISOLATION FIRST
+        print("\n🔍 RUNNING SEQUENTIAL DRONE INITIALIZATION\n")
+        await self.drone.connect()
         
-        try:
-            print("[Navigation] Sending zero velocity hover command...")
-            asyncio.create_task(self.drone.send_velocity(0, 0, 0, self.pose["yaw_deg"]))
-        except Exception:
-            pass
+        print("[System] Waiting for telemetry stream handshake...")
+        await asyncio.sleep(3.0) 
+        
+        print("Starting position monitor.")
+        self.monitor_task = asyncio.create_task(
+            position_monitor_task(self.drone, self.position_state, asyncio.Event())
+        )
+        
+        # 🛡️ RETRY LOOP FOR HEADING ESTIMATE SETTLING
+        print("[Navigation] Attempting to Arm and Take Off...")
+        armed_successfully = False
+        attempt = 1
+        
+        while not armed_successfully and self.running:
+            try:
+                await self.drone.arm_and_takeoff()
+                armed_successfully = True
+                print("[Navigation] Takeoff sequence accepted successfully!")
+            except ActionError as e:
+                print(f"⚠️ [Attempt {attempt}] Arming denied by PX4: Heading estimate probably still invalid. Retrying in 3 seconds...")
+                attempt += 1
+                await asyncio.sleep(3.0)
+        
+        print("[System] Takeoff sequence complete. Holding 5 seconds to stabilize hover...")
+        await asyncio.sleep(5.0)  
 
-        if self.vision_worker is not None:
-            print("[Vision] Stopping inference worker thread...")
-            self.vision_worker.stop()
-            
-        print("[System] Exited cleanly.")
+        # 2. DRONE IS SAFELY HOVERING. INITIALIZE HEAVY YOLO RESOURCES NOW.
+        print("\n[System] Hover stable. Initializing YOLOv10 detector framework...")
+        self.detector = Detector(
+            base_model_path="yolov10n.pt",
+            finetuned_weights=self.finetuned_path,
+            device="cpu",
+            conf_threshold=0.6
+        )
 
+        print("[System] Spinning up background YOLO inference worker thread...")
+        target_save_directory = "../detections"
+        self.worker = DetectorWorker(
+            self.detection_queue, self.ui_queue, self.vision_shared_state, self.detector,
+            save_dir=target_save_directory
+        )
+        self.worker.start()
 
-# ===================================
-# ENTRY POINT
-# ===================================
-async def main():
-    app = IntegratedDroneApp()
-    task = asyncio.create_task(app.run())
-    try:
-        await task
-    except KeyboardInterrupt:
-        print("\n⌨️ Stopping application via Keyboard Interrupt...")
-        app.stop()
-        await asyncio.gather(task, return_exceptions=True)
+        print("[Vision] Connecting to Gazebo network streams...")
+        rgb_receiver = RGBReceiver(self.rgb_topic, self.vision_shared_state, self.detection_queue)
+        
+        # Pull down initialization frame coordinates
+        await self.update_pose()
+        self.target_yaw_deg = self.pose["yaw_deg"]
+
+        # 3. START CONCURRENT MONITORING LOOPS
+        print("[System] All systems nominal. Launching concurrent runtime loops.")
+        await asyncio.gather(
+            self.run_navigation_loop(),
+            self.run_vision_ui()
+        )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Hardcode VM networking overrides within the runtime environment 
+    os.environ["GZ_IP"] = "127.0.0.1"
+    os.environ["GZ_PARTITION"] = "default"
+    
+    app = IntegratedDroneApp()
+    try:
+        asyncio.run(app.main_lifecycle())
+    except KeyboardInterrupt:
+        print("\n⌨️ Shutdown command received.")
+    finally:
+        app.stop()
+        print("[System] Exited cleanly.")
