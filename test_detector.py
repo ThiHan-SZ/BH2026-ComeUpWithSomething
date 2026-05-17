@@ -39,7 +39,7 @@ print("[TEST] Model loaded. Waiting for Gazebo frames...")
 frame_q = queue.Queue(maxsize=1)
 stats = {"frames": 0, "detections": 0, "saved": 0}
 
-def gz_callback(msg: Image):
+def gz_callback(msg):
     """Gazebo callback — convert RGB→BGR and push to queue."""
     try:
         raw = np.frombuffer(msg.data, dtype=np.uint8)
